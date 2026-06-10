@@ -128,6 +128,55 @@ jobs:
             # Wait for load balancers and their ENIs to fully detach
             echo "Waiting 60s for load balancer ENI release..."
             sleep 60
+
+            # Delete any remaining security groups in the VPC (except default)
+            SG_IDS=$(aws ec2 describe-security-groups \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
+              --output text 2>/dev/null || echo "")
+            for SG in $SG_IDS; do
+              aws ec2 delete-security-group --group-id "$SG" 2>/dev/null || true
+            done
+
+            # Detach and delete any remaining internet gateways
+            IGW_IDS=$(aws ec2 describe-internet-gateways \
+              --filters "Name=attachment.vpc-id,Values=${VPC_ID}" \
+              --query 'InternetGateways[*].InternetGatewayId' \
+              --output text 2>/dev/null || echo "")
+            for IGW in $IGW_IDS; do
+              aws ec2 detach-internet-gateway --internet-gateway-id "$IGW" --vpc-id "${VPC_ID}" 2>/dev/null || true
+              aws ec2 delete-internet-gateway --internet-gateway-id "$IGW" 2>/dev/null || true
+            done
+
+            # Delete any remaining subnets
+            SUBNET_IDS=$(aws ec2 describe-subnets \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query 'Subnets[*].SubnetId' \
+              --output text 2>/dev/null || echo "")
+            for SUBNET in $SUBNET_IDS; do
+              aws ec2 delete-subnet --subnet-id "$SUBNET" 2>/dev/null || true
+            done
+
+            # Delete any remaining route tables (except main)
+            RT_IDS=$(aws ec2 describe-route-tables \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query 'RouteTables[?Associations[?Main!=`true`]||!Associations].RouteTableId' \
+              --output text 2>/dev/null || echo "")
+            for RT in $RT_IDS; do
+              aws ec2 delete-route-table --route-table-id "$RT" 2>/dev/null || true
+            done
+
+            # Delete any remaining network interfaces
+            ENI_IDS2=$(aws ec2 describe-network-interfaces \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query 'NetworkInterfaces[*].NetworkInterfaceId' \
+              --output text 2>/dev/null || echo "")
+            for ENI in $ENI_IDS2; do
+              aws ec2 delete-network-interface --network-interface-id "$ENI" 2>/dev/null || true
+            done
+
+            echo "Waiting 30s after VPC dependency cleanup..."
+            sleep 30
           fi
       - name: Terraform destroy
         working-directory: terraform
