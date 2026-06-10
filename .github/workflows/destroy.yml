@@ -3,6 +3,10 @@ name: Destroy — githubekssp
 on:
   workflow_dispatch:
 
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   destroy:
     name: Destroy EKS (kubectl + Terraform)
@@ -37,11 +41,6 @@ jobs:
         id: cluster
         working-directory: terraform
         run: |
-          # terraform output already returns the FULL cluster name ("<name>-eks").
-          # Only the PROJECT_NAME fallback needs the "-eks" suffix appended — the
-          # old code appended it unconditionally, producing "<name>-eks-eks" which
-          # no cluster matches, so update-kubeconfig silently failed and the ALB
-          # ingress was never deleted before destroy (DependencyViolation).
           CLUSTER=$(terraform output -raw cluster_name 2>/dev/null || true)
           if [ -z "$CLUSTER" ]; then
             BASE=$(echo "${{ secrets.PROJECT_NAME }}" \
@@ -56,8 +55,6 @@ jobs:
           echo "name=${CLUSTER}" >> $GITHUB_OUTPUT
       - name: Update kubeconfig (best-effort)
         run: |
-          # Don't swallow stderr — if this fails we need to SEE why, otherwise
-          # the ingress cleanup below silently no-ops against localhost:8080.
           aws eks update-kubeconfig \
             --region "${{ secrets.AWS_REGION }}" \
             --name "${{ steps.cluster.outputs.name }}" \
@@ -72,34 +69,21 @@ jobs:
               | sed 's/^-//; s/-$//' \
               | cut -c1-24 \
               | sed 's/-$//') || true
-          # If kubectl can't reach the cluster, deleting the ingress here is the
-          # ONLY thing that tears down the ALB (the LB controller owns it via a
-          # finalizer, outside Terraform). Bail loudly rather than pretend success.
           if ! kubectl version >/dev/null 2>&1; then
             echo "::warning::kubectl cannot reach the cluster — ALB may survive and block VPC destroy"
           fi
-          # Remove ingress first so the ALB is deprovisioned before VPC destroy.
-          # kubectl delete blocks on the ingress finalizer until the controller
-          # has actually deleted the ALB, so this is the real wait (timeout-capped
-          # so a wedged controller can't hang the job forever).
           kubectl delete ingress --all -n "$NAMESPACE" --ignore-not-found --timeout=300s || true
           kubectl delete service --all -n "$NAMESPACE" --ignore-not-found --timeout=180s || true
           helm uninstall aws-load-balancer-controller -n kube-system 2>/dev/null || true
-          # Extra cushion for the ELB/ENIs to fully detach from the subnets.
-          sleep 30
+          # Wait for ALB and ENIs to be fully released before proceeding
+          echo "Waiting 90s for ALB/ENI teardown..."
+          sleep 90
 
-          # Disassociate and release any EIPs / public-IP mappings still attached
-          # to the VPC so the Internet Gateway can be detached cleanly.
           VPC_ID=$(aws ec2 describe-vpcs \
             --filters "Name=tag:Name,Values=*${{ secrets.PROJECT_NAME }}*" \
             --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "")
           if [ -n "$VPC_ID" ] && [ "$VPC_ID" != "None" ]; then
-            # Release EIPs associated with the VPC
-            ALLOC_IDS=$(aws ec2 describe-addresses \
-              --filters "Name=domain,Values=vpc" \
-              --query "Addresses[?AssociationId!=null] | [?NetworkInterfaceId!=null].AllocationId" \
-              --output text 2>/dev/null || echo "")
-            # Disassociate any network interfaces still in the VPC
+            # Disassociate and release EIPs still attached to the VPC
             ENI_IDS=$(aws ec2 describe-network-interfaces \
               --filters "Name=vpc-id,Values=${VPC_ID}" \
               --query 'NetworkInterfaces[*].NetworkInterfaceId' \
@@ -113,8 +97,37 @@ jobs:
                 aws ec2 disassociate-address --association-id "$ASSOC" 2>/dev/null || true
               fi
             done
-            # Extra wait for AWS to release the mappings
-            sleep 30
+
+            # Release any unattached EIPs in the VPC domain
+            ALLOC_IDS=$(aws ec2 describe-addresses \
+              --filters "Name=domain,Values=vpc" \
+              --query "Addresses[?AssociationId==null].AllocationId" \
+              --output text 2>/dev/null || echo "")
+            for ALLOC in $ALLOC_IDS; do
+              aws ec2 release-address --allocation-id "$ALLOC" 2>/dev/null || true
+            done
+
+            # Delete any remaining load balancers in the VPC
+            LB_ARNS=$(aws elbv2 describe-load-balancers \
+              --query "LoadBalancers[?VpcId=='${VPC_ID}'].LoadBalancerArn" \
+              --output text 2>/dev/null || echo "")
+            for LB_ARN in $LB_ARNS; do
+              echo "Deleting load balancer: $LB_ARN"
+              aws elbv2 delete-load-balancer --load-balancer-arn "$LB_ARN" 2>/dev/null || true
+            done
+
+            # Delete any remaining classic ELBs in the VPC
+            CLASSIC_LBS=$(aws elb describe-load-balancers \
+              --query "LoadBalancerDescriptions[?VPCId=='${VPC_ID}'].LoadBalancerName" \
+              --output text 2>/dev/null || echo "")
+            for CLB in $CLASSIC_LBS; do
+              echo "Deleting classic load balancer: $CLB"
+              aws elb delete-load-balancer --load-balancer-name "$CLB" 2>/dev/null || true
+            done
+
+            # Wait for load balancers and their ENIs to fully detach
+            echo "Waiting 60s for load balancer ENI release..."
+            sleep 60
           fi
       - name: Terraform destroy
         working-directory: terraform
