@@ -87,6 +87,35 @@ jobs:
           helm uninstall aws-load-balancer-controller -n kube-system 2>/dev/null || true
           # Extra cushion for the ELB/ENIs to fully detach from the subnets.
           sleep 30
+
+          # Disassociate and release any EIPs / public-IP mappings still attached
+          # to the VPC so the Internet Gateway can be detached cleanly.
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=*${{ secrets.PROJECT_NAME }}*" \
+            --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "")
+          if [ -n "$VPC_ID" ] && [ "$VPC_ID" != "None" ]; then
+            # Release EIPs associated with the VPC
+            ALLOC_IDS=$(aws ec2 describe-addresses \
+              --filters "Name=domain,Values=vpc" \
+              --query "Addresses[?AssociationId!=null] | [?NetworkInterfaceId!=null].AllocationId" \
+              --output text 2>/dev/null || echo "")
+            # Disassociate any network interfaces still in the VPC
+            ENI_IDS=$(aws ec2 describe-network-interfaces \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query 'NetworkInterfaces[*].NetworkInterfaceId' \
+              --output text 2>/dev/null || echo "")
+            for ENI in $ENI_IDS; do
+              ASSOC=$(aws ec2 describe-network-interfaces \
+                --network-interface-ids "$ENI" \
+                --query 'NetworkInterfaces[0].Association.AssociationId' \
+                --output text 2>/dev/null || echo "")
+              if [ -n "$ASSOC" ] && [ "$ASSOC" != "None" ]; then
+                aws ec2 disassociate-address --association-id "$ASSOC" 2>/dev/null || true
+              fi
+            done
+            # Extra wait for AWS to release the mappings
+            sleep 30
+          fi
       - name: Terraform destroy
         working-directory: terraform
         env:
