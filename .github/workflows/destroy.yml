@@ -1,0 +1,98 @@
+name: Destroy — githubekssp
+
+on:
+  workflow_dispatch:
+
+jobs:
+  destroy:
+    name: Destroy EKS (kubectl + Terraform)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.31.0'
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.15.0'
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+      - name: Resolve cluster name from state
+        id: cluster
+        working-directory: terraform
+        run: |
+          # terraform output already returns the FULL cluster name ("<name>-eks").
+          # Only the PROJECT_NAME fallback needs the "-eks" suffix appended — the
+          # old code appended it unconditionally, producing "<name>-eks-eks" which
+          # no cluster matches, so update-kubeconfig silently failed and the ALB
+          # ingress was never deleted before destroy (DependencyViolation).
+          CLUSTER=$(terraform output -raw cluster_name 2>/dev/null || true)
+          if [ -z "$CLUSTER" ]; then
+            BASE=$(echo "${{ secrets.PROJECT_NAME }}" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed 's/[^a-z0-9-]/-/g' \
+              | sed 's/-\{2,\}/-/g' \
+              | sed 's/^-//; s/-$//' \
+              | cut -c1-24 \
+              | sed 's/-$//')
+            CLUSTER="${BASE}-eks"
+          fi
+          echo "name=${CLUSTER}" >> $GITHUB_OUTPUT
+      - name: Update kubeconfig (best-effort)
+        run: |
+          # Don't swallow stderr — if this fails we need to SEE why, otherwise
+          # the ingress cleanup below silently no-ops against localhost:8080.
+          aws eks update-kubeconfig \
+            --region "${{ secrets.AWS_REGION }}" \
+            --name "${{ steps.cluster.outputs.name }}" \
+            || echo "Cluster not reachable — continuing with destroy"
+      - name: Delete Kubernetes resources before Terraform destroy
+        run: |
+          NAMESPACE=$(cd terraform && terraform output -raw namespace 2>/dev/null || \
+            echo "${{ secrets.PROJECT_NAME }}" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed 's/[^a-z0-9-]/-/g' \
+              | sed 's/-\{2,\}/-/g' \
+              | sed 's/^-//; s/-$//' \
+              | cut -c1-24 \
+              | sed 's/-$//') || true
+          # If kubectl can't reach the cluster, deleting the ingress here is the
+          # ONLY thing that tears down the ALB (the LB controller owns it via a
+          # finalizer, outside Terraform). Bail loudly rather than pretend success.
+          if ! kubectl version >/dev/null 2>&1; then
+            echo "::warning::kubectl cannot reach the cluster — ALB may survive and block VPC destroy"
+          fi
+          # Remove ingress first so the ALB is deprovisioned before VPC destroy.
+          # kubectl delete blocks on the ingress finalizer until the controller
+          # has actually deleted the ALB, so this is the real wait (timeout-capped
+          # so a wedged controller can't hang the job forever).
+          kubectl delete ingress --all -n "$NAMESPACE" --ignore-not-found --timeout=300s || true
+          kubectl delete service --all -n "$NAMESPACE" --ignore-not-found --timeout=180s || true
+          helm uninstall aws-load-balancer-controller -n kube-system 2>/dev/null || true
+          # Extra cushion for the ELB/ENIs to fully detach from the subnets.
+          sleep 30
+      - name: Terraform destroy
+        working-directory: terraform
+        env:
+          TF_VAR_node_instance_type: ${{ secrets.NODE_INSTANCE_TYPE }}
+        run: |
+          terraform destroy -auto-approve \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -var="container_image=placeholder"
